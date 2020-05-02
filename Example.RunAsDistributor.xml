@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?><ManagementPack SchemaVersion="2.0" ContentReadable="true" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Manifest>
+    <Identity>
+      <ID>Example.RunAsDistributor</ID>
+      <Version>1.0.0.0</Version>
+    </Identity>
+    <Name>Example.RunAsDistributor</Name>
+    <References>
+      <Reference Alias="SystemCenter">
+        <ID>Microsoft.SystemCenter.Library</ID>
+        <Version>7.0.8433.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="Windows">
+        <ID>Microsoft.Windows.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+      <Reference Alias="System">
+        <ID>System.Library</ID>
+        <Version>7.5.8501.0</Version>
+        <PublicKeyToken>31bf3856ad364e35</PublicKeyToken>
+      </Reference>
+    </References>
+  </Manifest>
+  <Monitoring>
+    <Rules>
+      <Rule ID="Example.RunAsDistributor.Rule" Enabled="true" Target="SystemCenter!Microsoft.SystemCenter.AllManagementServersPool" ConfirmDelivery="false" Remotable="true" Priority="Normal" DiscardLevel="100">
+        <Category>Custom</Category>
+        <DataSources>
+          <DataSource ID="Scheduler" TypeID="System!System.Scheduler">
+            <Scheduler>
+              <SimpleReccuringSchedule>
+                <Interval Unit="Seconds">86425</Interval>
+              </SimpleReccuringSchedule>
+              <ExcludeDates />
+            </Scheduler>
+          </DataSource>
+        </DataSources>
+        <WriteActions>
+          <WriteAction ID="ExecuteScript" TypeID="Windows!Microsoft.Windows.PowerShellWriteAction">
+            <ScriptName>RunAsDistributor.ps1</ScriptName>
+            <ScriptBody>
+#  Health Service Run As Account by Group Distribution Script
+#  by Kevin Holman
+#  Collaboration by Matt Taylor, Scott Murray, Mark Manty, Tim McFadden, Russ Slaten
+#
+#  This script takes a SCOM group by name, and distributes a RunAs account
+#    to all members of the group including nodes of clusters
+#
+#  Version 2.0
+
+
+Function DistributeRunAsAccounts ($ActRunAsDisplayName, $DistGroupName)
+{
+
+  #Get the SCOM Run As account by display name
+  $ActRunAs = Get-SCOMRunAsAccount $ActRunAsDisplayName
+  $ActRunAsDomain = $ActRunAs.Domain
+  $ActRunAsUser = $ActRunAs.UserName
+  $momapi.LogScriptEvent("RunAsHSDist.ps1",3252,0,"Debug: The main function is starting for account display name: ($ActRunAsDisplayName) which resolved to: ($ActRunAsDomain\$ActRunAsUser) and group display name: ($DistGroupName) executed as ($WhoamI)")
+
+  #Choose a group by displayname.  
+  #This group contains Windows Computers objects for agent managed computers and for cluster virtual server names.
+  $DistComputerNames = Get-SCOMGroup -DisplayName $DistGroupName | Get-SCOMClassInstance | Select-Object -Property DisplayName
+  $Distcompnamecount = $DistComputerNames.count
+  $momapi.LogScriptEvent("RunAsHSDist.ps1",3253,0,"Debug: Items in Group equal: ($Distcompnamecount) for account: ($ActRunAsName) and group: ($DistGroupName) executed as ($WhoamI)")
+
+  #Exit script and log error if group returns no valid instances of Windows Computer property displayname
+  IF ($DistComputerNames.count -lt 1)
+  {
+    #Log an event that our script is ending in error
+    $momapi.LogScriptEvent("RunAsHSDist.ps1",3254,2,"RunAs HealthService Distribution Script ended in error.  The group was not found or contained no objects. for account: ($ActRunAsName) and group: ($DistGroupName) executed as ($WhoamI)")
+    Break
+  }
+
+  #Set DistAgents to empty
+  $DistAgents = @()
+
+  #Get an array of Health Service Objects which match the displayname of the group membership objects
+  Foreach ($DistComputerName in $DistComputerNames)
+    {
+    $DistAgents += $HealthServiceClass | where {$_.DisplayName -eq $DistComputerName.DisplayName} 
+    }
+
+  IF ($DistAgents.count -gt 0)
+   {
+    #Compare lists (diff) to get a list of all Computers in the group that do not have a matching HealthService.  
+    #Assume these are Network Name values for clustered resource groups
+    $DistClusters = Compare-Object $DistComputerNames.DisplayName $DistAgents.DisplayName -PassThru
+   }
+  ELSE
+   {
+    #Assume that the group only contained Windows Cluster objects and no agents.
+    $DistClusters = $DistComputerNames
+   }
+
+  # If there are no clusters in the group skip the cluster node section of the script
+  IF ($DistClusters.count -ge 1)
+    {
+    #Set UknownObject array equal to null to ensure it is empty from any previous script runs
+    $UnknownObjects = @()
+    #Get the relationship ID we need to find nodes that host a cluster
+    $rid = Get-SCOMRelationship -DisplayName 'Health Service manages Entity'
+    #Get all Cluster virtual server class instances in an array
+    $vsclass = Get-SCOMClass -name 'Microsoft.Windows.Cluster.VirtualServer' | Get-scomclassinstance
+    #Create a loop to find the node names of each cluster and add those names to an array
+
+    foreach ($clname in $DistClusters)
+           {
+               #write-host 'clname: '$clname
+               #Get the Virtual Server class instance for each cluster name
+               $vs = $vsclass | where-object {$_.DisplayName -eq $clname}
+               #Continue with the script if we got a match for a virtual server class
+               IF ($vs.count -gt 0)
+                {
+                #write-host 'virtual server: '$vs.DisplayName
+                #Get the nodes in an array which have a health service relationship managing the virtual server cluster name
+                $nodes = Get-SCOMRelationshipInstance -TargetInstance $vs | Where-Object {$_.relationshipid -eq $rid.id} | Select-Object -Property SourceObject
+                #write-host 'nodes: '$nodes.sourceobject
+                #Get an array of SCOM Agent objects which match the displayname of objects in the nodenames array and check first to ensure no duplicates
+                Foreach ($node in $nodes)
+                    {
+                    If ($DistAgents -notcontains $node.SourceObject)
+                        {
+                        $DistAgents += $HealthServiceClass | where {$_.DisplayName -eq $node.SourceObject}
+                        }
+                    }
+                }
+               #If objects in the group do not match the displayname for a virtual server class nor a healthservice displayname add them to unknown objects array
+               ELSE
+               {
+               $UnknownObjects += $clname
+               }   
+
+            }
+    }
+
+  #Get the current RunAs account distribution as it exists today and save it in an array
+  #Comment out this entire section if you want to ignore the current distribution and ONLY go with what it in the group
+  $ActRunAsDistOld = (Get-SCOMRunAsDistribution $ActRunAs).securedistribution
+  #Check and see if there is at least one health service distribution defined - ignore if none found
+  #If at least one distribution is found, check for duplicates then add non dupes to the DistAgents array
+  IF ($ActRunAsDistOld.count -ge 1)
+    {
+    Foreach ($ActRunAsOld in $ActRunAsDistOld)
+        {
+        IF ($DistAgents.DisplayName -notcontains $ActRunAsOld.DisplayName)
+            {
+            $DistAgents += $ActRunAsOld
+            }
+        }
+    }
+
+  #Set (replace) the RunAs distribution list for the defined RunAs account to whatever we found in DistAgents
+  Set-SCOMRunAsDistribution ($ActRunAs) -MoreSecure -SecureDistribution $DistAgents
+
+  #Log event that script is complete, additional variables for logging purposes
+  $DistAgentsCount = $DistAgents.count
+  $ActRunAsDistOldCount = $ActRunAsDistOld.count
+  If ($UnknownObjects.Count -lt 1)
+  {
+    $UnknownObjects = 'NONE'
+  }
+
+  $momapi.LogScriptEvent("RunAsHSDist.ps1",3255,0,"RunAs HealthService Distribution Script Complete. Resolved Account name: $ActRunAsName, Configured $DistAgentscount Healthservice objects.  Previously there were $ActRunAsDistOldcount objects configured.  Unknown Objects identified: $UnknownObjects.  Health service objects added: $DistAgents.  For account displayname: ($ActRunAsDisplayName) and group displayname: ($DistGroupName) executed as ($WhoamI)")
+  }
+#End Function
+
+
+
+#Begin Main Body of Script
+$StartTime = Get-Date
+$SCOMServer = "localhost"
+$WhoamI = whoami
+
+#Load the OM API
+$momapi = New-Object -comObject "MOM.ScriptAPI"
+#Log an event that our script is starting
+$momapi.LogScriptEvent("RunAsHSDist.ps1",3250,0,"RunAs HealthService Distribution Script Starting.  Executed as ($WhoamI)")
+
+#Import OM Module
+Import-Module OperationsManager;
+New-SCOMManagementGroupConnection $SCOMServer
+
+#Get all the health service class instances in the management group.  This may take a long time
+$HSStartTime = Get-Date
+$HealthServiceClass = Get-SCOMclass -DisplayName "Health Service"| Get-SCOMClassInstance
+$HSCount = $HealthServiceClass.count
+$HSEndTime = Get-Date
+$HSTime = ($HSEndTime - $HSStartTime).TotalSeconds
+#Log an event for how long this took and how many healthservice objects were returned
+$momapi.LogScriptEvent("RunAsHSDist.ps1",3251,0,"Debug:  Returned ($HSCount) health service objects in ($HStime) seconds.   Executed as ($WhoamI)")
+
+
+
+
+#Add multiple "Main" lines for each accopunt and group pair that needs dynamic distribution
+
+DistributeRunAsAccounts "SQL Monitoring RunAs Account OpsMgr Domain" "SQL Server Computers"
+DistributeRunAsAccounts "SQL Monitoring RunAs Account DMZ Domain" "DMZ Computers"
+
+
+
+$EndTime = Get-Date
+$ScriptTime = ($EndTime - $StartTime).TotalSeconds
+#Log an event for script ending and total execution time.
+$momapi.LogScriptEvent("RunAsHSDist.ps1",3260,0,"Debug:  Script Ending.  Total runtime ($ScriptTime) seconds.   Executed as ($WhoamI)")
+#End Script         
+            </ScriptBody>
+            <TimeoutSeconds>900</TimeoutSeconds>
+          </WriteAction>
+        </WriteActions>
+      </Rule>
+     </Rules>
+  </Monitoring>
+  <LanguagePacks>
+    <LanguagePack ID="ENU" IsDefault="false">
+      <DisplayStrings>
+        <DisplayString ElementID="Example.RunAsDistributor">
+          <Name>Example RunAs Account Distributor MP</Name>
+          <Description>Runs a PowerShell script that distributes the RunAs Account to all servers in a given SCOM group.</Description>
+        </DisplayString>
+        <DisplayString ElementID="Example.RunAsDistributor.Rule">
+          <Name>Example RunAs Distributor Rule</Name>
+          <Description />
+        </DisplayString>
+        <DisplayString ElementID="Example.RunAsDistributor.Rule" SubElementID="ExecuteScript">
+          <Name>PowerShell Script Serialized Object Write Action</Name>
+        </DisplayString>
+        <DisplayString ElementID="Example.RunAsDistributor.Rule" SubElementID="Scheduler">
+          <Name>Scheduler</Name>
+        </DisplayString>
+      </DisplayStrings>
+      <KnowledgeArticles></KnowledgeArticles>
+    </LanguagePack>
+  </LanguagePacks>
+</ManagementPack>
